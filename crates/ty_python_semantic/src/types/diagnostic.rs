@@ -2,7 +2,7 @@ use super::call::CallErrorKind;
 use super::context::InferContext;
 use super::mro::DuplicateBaseError;
 use super::{
-    CallArguments, CallDunderError, ClassBase, ClassLiteral, KnownClass,
+    CallArguments, CallDunderError, ClassBase, ClassLiteral, KnownClass, StmtClassLiteral,
     add_inferred_python_version_hint_to_diagnostic,
 };
 use crate::diagnostic::did_you_mean;
@@ -2800,12 +2800,12 @@ pub(super) fn report_implicit_return_type(
             "Only classes that directly inherit from `typing.Protocol` \
             or `typing_extensions.Protocol` are considered protocol classes",
         );
-        sub_diagnostic.annotate(
-            Annotation::primary(class.header_span(db)).message(format_args!(
+        if let Some(span) = class.header_span(db) {
+            sub_diagnostic.annotate(Annotation::primary(span).message(format_args!(
                 "`Protocol` not present in `{class}`'s immediate bases",
                 class = class.name(db)
-            )),
-        );
+            )));
+        }
         diagnostic.sub(sub_diagnostic);
 
         diagnostic.info("See https://typing.python.org/en/latest/spec/protocol.html#");
@@ -2974,7 +2974,7 @@ pub(crate) fn report_invalid_exception_cause(context: &InferContext, node: &ast:
 
 pub(crate) fn report_instance_layout_conflict(
     context: &InferContext,
-    class: ClassLiteral,
+    class: StmtClassLiteral,
     node: &ast::StmtClassDef,
     disjoint_bases: &IncompatibleBases,
 ) {
@@ -3009,7 +3009,7 @@ pub(crate) fn report_instance_layout_conflict(
 
         let span = context.span(&node.bases()[*node_index]);
         let mut annotation = Annotation::secondary(span.clone());
-        if disjoint_base.class == *originating_base {
+        if originating_base.as_stmt() == Some(disjoint_base.class) {
             match disjoint_base.kind {
                 DisjointBaseKind::DefinesSlots => {
                     annotation = annotation.message(format_args!(
@@ -3179,7 +3179,7 @@ pub(crate) fn report_invalid_argument_number_to_special_form(
 pub(crate) fn report_bad_argument_to_get_protocol_members(
     context: &InferContext,
     call: &ast::ExprCall,
-    class: ClassLiteral,
+    class: StmtClassLiteral,
 ) {
     let Some(builder) = context.report_lint(&INVALID_ARGUMENT_TYPE, call) else {
         return;
@@ -3232,9 +3232,9 @@ pub(crate) fn report_bad_argument_to_protocol_interface(
                 class.name(db)
             ),
         );
-        class_def_diagnostic.annotate(Annotation::primary(
-            class.class_literal(db).0.header_span(db),
-        ));
+        if let Some((class_literal, _)) = class.stmt_class_literal(db) {
+            class_def_diagnostic.annotate(Annotation::primary(class_literal.header_span(db)));
+        }
         diagnostic.sub(class_def_diagnostic);
     }
 
@@ -3292,10 +3292,11 @@ pub(crate) fn report_runtime_check_against_non_runtime_checkable_protocol(
                 but it is not declared as runtime-checkable"
         ),
     );
-    class_def_diagnostic.annotate(
-        Annotation::primary(protocol.header_span(db))
-            .message(format_args!("`{class_name}` declared here")),
-    );
+    if let Some(span) = protocol.header_span(db) {
+        class_def_diagnostic.annotate(
+            Annotation::primary(span).message(format_args!("`{class_name}` declared here")),
+        );
+    }
     diagnostic.sub(class_def_diagnostic);
 
     diagnostic.info(format_args!(
@@ -3323,10 +3324,12 @@ pub(crate) fn report_attempted_protocol_instantiation(
         SubDiagnosticSeverity::Info,
         format_args!("Protocol classes cannot be instantiated"),
     );
-    class_def_diagnostic.annotate(
-        Annotation::primary(protocol.header_span(db))
-            .message(format_args!("`{class_name}` declared as a protocol here")),
-    );
+    if let Some(span) = protocol.header_span(db) {
+        class_def_diagnostic.annotate(
+            Annotation::primary(span)
+                .message(format_args!("`{class_name}` declared as a protocol here")),
+        );
+    }
     diagnostic.sub(class_def_diagnostic);
 }
 
@@ -3411,10 +3414,12 @@ pub(crate) fn report_undeclared_protocol_member(
         "Assigning to an undeclared variable in a protocol class \
     leads to an ambiguous interface",
     );
-    class_def_diagnostic.annotate(
-        Annotation::primary(protocol_class.header_span(db))
-            .message(format_args!("`{class_name}` declared as a protocol here",)),
-    );
+    if let Some(span) = protocol_class.header_span(db) {
+        class_def_diagnostic.annotate(
+            Annotation::primary(span)
+                .message(format_args!("`{class_name}` declared as a protocol here",)),
+        );
+    }
     diagnostic.sub(class_def_diagnostic);
 
     diagnostic.info(format_args!(
@@ -3425,7 +3430,7 @@ pub(crate) fn report_undeclared_protocol_member(
 
 pub(crate) fn report_duplicate_bases(
     context: &InferContext,
-    class: ClassLiteral,
+    class: StmtClassLiteral,
     duplicate_base_error: &DuplicateBaseError,
     bases_list: &[ast::Expr],
 ) {
@@ -3472,7 +3477,7 @@ pub(crate) fn report_invalid_or_unsupported_base(
     context: &InferContext,
     base_node: &ast::Expr,
     base_type: Type,
-    class: ClassLiteral,
+    class: StmtClassLiteral,
 ) {
     let db = context.db();
     let instance_of_type = KnownClass::Type.to_instance(db);
@@ -3582,7 +3587,7 @@ fn report_unsupported_base(
     context: &InferContext,
     base_node: &ast::Expr,
     base_type: Type,
-    class: ClassLiteral,
+    class: StmtClassLiteral,
 ) {
     let Some(builder) = context.report_lint(&UNSUPPORTED_BASE, base_node) else {
         return;
@@ -3605,7 +3610,7 @@ fn report_invalid_base<'ctx, 'db>(
     context: &'ctx InferContext<'db, '_>,
     base_node: &ast::Expr,
     base_type: Type<'db>,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
 ) -> Option<LintDiagnosticGuard<'ctx, 'db>> {
     let builder = context.report_lint(&INVALID_BASE, base_node)?;
     let mut diagnostic = builder.into_diagnostic(format_args!(
@@ -3701,7 +3706,7 @@ pub(crate) fn report_invalid_key_on_typed_dict<'db>(
 
 pub(super) fn report_namedtuple_field_without_default_after_field_with_default<'db>(
     context: &InferContext<'db, '_>,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
     (field, field_def): (&str, Option<Definition<'db>>),
     (field_with_default, field_with_default_def): &(Name, Option<Definition<'db>>),
 ) {
@@ -3750,7 +3755,7 @@ pub(super) fn report_namedtuple_field_without_default_after_field_with_default<'
 
 pub(super) fn report_named_tuple_field_with_leading_underscore<'db>(
     context: &InferContext<'db, '_>,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
     field_name: &str,
     field_definition: Option<Definition<'db>>,
 ) {
@@ -3874,7 +3879,7 @@ pub(crate) fn report_cannot_delete_typed_dict_key<'db>(
 
 pub(crate) fn report_invalid_type_param_order<'db>(
     context: &InferContext<'db, '_>,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
     node: &ast::StmtClassDef,
     typevar_with_default: TypeVarInstance<'db>,
     invalid_later_typevars: &[TypeVarInstance<'db>],
@@ -3959,7 +3964,7 @@ pub(crate) fn report_invalid_type_param_order<'db>(
 pub(crate) fn report_rebound_typevar<'db>(
     context: &InferContext<'db, '_>,
     typevar_name: &ast::name::Name,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
     class_node: &ast::StmtClassDef,
     other_typevar: BoundTypeVarInstance<'db>,
 ) {
@@ -3978,7 +3983,7 @@ pub(crate) fn report_rebound_typevar<'db>(
         return;
     };
     let span = match binding_type(db, other_definition) {
-        Type::ClassLiteral(class) => Some(class.header_span(db)),
+        Type::ClassLiteral(class) => class.as_stmt().map(|stmt| stmt.header_span(db)),
         Type::FunctionLiteral(function) => function.spans(db).map(|spans| spans.signature),
         _ => return,
     };
@@ -4034,10 +4039,11 @@ pub(super) fn report_invalid_method_override<'db>(
     let superclass_name = superclass.name(db);
 
     let overridden_method = if class_name == superclass_name {
-        format!(
-            "{superclass}.{member}",
-            superclass = superclass.qualified_name(db),
-        )
+        if let Some(qualified_name) = superclass.qualified_name(db) {
+            format!("{qualified_name}.{member}")
+        } else {
+            format!("{superclass_name}.{member}")
+        }
     } else {
         format!("{superclass_name}.{member}")
     };
@@ -4086,7 +4092,10 @@ pub(super) fn report_invalid_method_override<'db>(
         );
     }
 
-    let superclass_scope = superclass.class_literal(db).0.body_scope(db);
+    let Some((superclass_literal, _)) = superclass.stmt_class_literal(db) else {
+        return;
+    };
+    let superclass_scope = superclass_literal.body_scope(db);
 
     match superclass_method_kind {
         MethodKind::NotSynthesized => {
@@ -4152,10 +4161,12 @@ pub(super) fn report_invalid_method_override<'db>(
                 )),
             };
 
-            sub.annotate(
-                Annotation::primary(superclass.header_span(db))
-                    .message(format_args!("Definition of `{superclass_name}`")),
-            );
+            if let Some(span) = superclass.header_span(db) {
+                sub.annotate(
+                    Annotation::primary(span)
+                        .message(format_args!("Definition of `{superclass_name}`")),
+                );
+            }
             diagnostic.sub(sub);
         }
     }
@@ -4217,7 +4228,10 @@ pub(super) fn report_overridden_final_method<'db>(
     };
 
     let superclass_name = if superclass.name(db) == subclass.name(db) {
-        superclass.qualified_name(db).to_string()
+        superclass
+            .qualified_name(db)
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| superclass.name(db).to_string())
     } else {
         superclass.name(db).to_string()
     };
@@ -4273,9 +4287,10 @@ pub(super) fn report_overridden_final_method<'db>(
     // but you'd want to delete the `@my_property.deleter` as well as the getter and the deleter,
     // and we don't model property deleters at all right now.
     if let Type::FunctionLiteral(function) = subclass_type {
-        let class_node = subclass
-            .class_literal(db)
-            .0
+        let Some((subclass_literal, _)) = subclass.stmt_class_literal(db) else {
+            return;
+        };
+        let class_node = subclass_literal
             .body_scope(db)
             .node(db)
             .expect_class()
@@ -4573,9 +4588,9 @@ fn report_unsupported_binary_operation_impl<'a>(
 
 pub(super) fn report_bad_frozen_dataclass_inheritance<'db>(
     context: &InferContext<'db, '_>,
-    class: ClassLiteral<'db>,
+    class: StmtClassLiteral<'db>,
     class_node: &ast::StmtClassDef,
-    base_class: ClassLiteral<'db>,
+    base_class: StmtClassLiteral<'db>,
     base_class_node: &ast::Expr,
     base_class_params: DataclassFlags,
 ) {

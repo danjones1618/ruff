@@ -1458,7 +1458,11 @@ impl<'db> Type<'db> {
                 if literal.enum_class_instance(db) != Type::NominalInstance(instance) {
                     return ConstraintSet::from(false);
                 }
-                ConstraintSet::from(is_single_member_enum(db, instance.class_literal(db)))
+                ConstraintSet::from(
+                    instance
+                        .class_literal(db)
+                        .is_some_and(|class| is_single_member_enum(db, class)),
+                )
             }
 
             (Type::PropertyInstance(left), Type::PropertyInstance(right)) => {
