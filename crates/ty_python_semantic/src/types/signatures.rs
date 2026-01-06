@@ -722,7 +722,7 @@ impl<'db> Signature<'db> {
     pub(super) fn wrap_coroutine_return_type(self, db: &'db dyn Db) -> Self {
         let return_ty = self.return_ty.map(|return_ty| {
             KnownClass::CoroutineType
-                .to_specialized_instance(db, [Type::any(), Type::any(), return_ty])
+                .to_specialized_instance(db, &[Type::any(), Type::any(), return_ty])
         });
         Self { return_ty, ..self }
     }
