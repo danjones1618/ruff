@@ -3048,12 +3048,12 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 let specialization_result = builder.infer_map_with_variance(
                     expected_type,
                     variadic_argument_type.unwrap_or(argument_type),
-                    |(identity, inferred_ty), variance| {
+                    |(type_var, inferred_ty), variance| {
                         // Avoid widening the inferred type if it is already assignable to the
                         // preferred declared type.
                         if preferred_type_mappings
                             .as_ref()
-                            .and_then(|types| types.get(&identity))
+                            .and_then(|types| types.get(&type_var.identity(self.db)))
                             .is_some_and(|preferred_ty| {
                                 inferred_ty.is_assignable_to(self.db, *preferred_ty)
                             })
@@ -3062,7 +3062,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         }
 
                         variance_in_arguments
-                            .entry(identity)
+                            .entry(type_var.identity(self.db))
                             .and_modify(|current| *current = current.join(variance))
                             .or_insert(variance);
 

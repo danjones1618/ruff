@@ -1518,24 +1518,22 @@ impl<'db> PartialSpecialization<'_, 'db> {
 
 /// Performs type inference between parameter annotations and argument types, producing a
 /// specialization of a generic function.
-pub(crate) struct SpecializationBuilder<'db> {
+pub(crate) struct SpecializationBuilder<'a, 'db> {
     db: &'db dyn Db,
-    inferable: InferableTypeVars<'db, 'db>,
+    inferable: InferableTypeVars<'a, 'db>,
     types: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
-    variables: FxHashMap<BoundTypeVarIdentity<'db>, BoundTypeVarInstance<'db>>,
 }
 
 /// An assignment from a bound type variable to a given type, along with the variance of the outermost
 /// type with respect to the type variable.
-pub(crate) type TypeVarAssignment<'db> = (BoundTypeVarIdentity<'db>, Type<'db>);
+pub(crate) type TypeVarAssignment<'db> = (BoundTypeVarInstance<'db>, Type<'db>);
 
-impl<'db> SpecializationBuilder<'db> {
-    pub(crate) fn new(db: &'db dyn Db, inferable: InferableTypeVars<'db, 'db>) -> Self {
+impl<'a, 'db> SpecializationBuilder<'a, 'db> {
+    pub(crate) fn new(db: &'db dyn Db, inferable: InferableTypeVars<'a, 'db>) -> Self {
         Self {
             db,
             inferable,
             types: FxHashMap::default(),
-            variables: FxHashMap::default(),
         }
     }
 
@@ -1566,7 +1564,6 @@ impl<'db> SpecializationBuilder<'db> {
             types,
             db: self.db,
             inferable: self.inferable,
-            variables: self.variables.clone(),
         }
     }
 
@@ -1586,12 +1583,16 @@ impl<'db> SpecializationBuilder<'db> {
         ty: Type<'db>,
         mut f: impl FnMut(TypeVarAssignment<'db>) -> Option<Type<'db>>,
     ) {
-        let identity = bound_typevar.identity(self.db);
-        let Some(ty) = f((identity, ty)) else {
+        // TODO:
+        // if !bound_typevar.is_inferable(self.db, self.inferable) {
+        //     return;
+        // }
+
+        let Some(ty) = f((bound_typevar, ty)) else {
             return;
         };
 
-        match self.types.entry(identity) {
+        match self.types.entry(bound_typevar.identity(self.db)) {
             Entry::Occupied(mut entry) => {
                 // TODO: The spec says that when a ParamSpec is used multiple times in a signature,
                 // the type checker can solve it to a common behavioral supertype. We don't
@@ -1607,7 +1608,6 @@ impl<'db> SpecializationBuilder<'db> {
             }
             Entry::Vacant(entry) => {
                 entry.insert(ty);
-                self.variables.insert(identity, bound_typevar);
             }
         }
     }
@@ -2061,28 +2061,51 @@ impl<'db> SpecializationBuilder<'db> {
             actual.apply_type_mapping(self.db, &type_mapping, TypeContext::default());
 
         // Recover the synthetic type variables.
-        let synthetic_specialization = match type_mapping {
+        let synthetic_types = match type_mapping {
             TypeMapping::UniqueSpecialization { specialization } => specialization.into_inner(),
             _ => unreachable!(),
         };
 
         // We can't recurse any further, just perform a regular inference with the current polarity.
-        if synthetic_specialization.is_empty() {
+        if synthetic_types.is_empty() {
             return self.infer_map_impl(formal, actual, &mut |type_assignment| {
                 f(type_assignment, polarity)
             });
         }
 
-        let synthetic_type_vars = synthetic_specialization.iter().map(|(typevar, _)| *typevar);
-        let synthetic_types = synthetic_specialization.iter().map(|(_, ty)| *ty).collect();
-        let synthetic_specialization =
+        // There may be inferable type variables in the actual type, in which we case we must mark
+        // the synthetic type variables that replace them as inferable.
+        let mut synthetic_inferable = FxHashSet::default();
+        for (synthetic_typevar, ty) in &synthetic_types {
+            if let Type::TypeVar(formal_type_var) = ty
+                && formal_type_var.is_inferable(self.db, self.inferable)
+            {
+                synthetic_inferable.insert(synthetic_typevar.identity(self.db));
+            }
+        }
+        let synthetic_inferable = InferableTypeVars::One(&synthetic_inferable);
+
+        let synthetic_specialization = {
+            let synthetic_type_vars = synthetic_types.iter().map(|(typevar, _)| *typevar);
+            let synthetic_types = synthetic_types.iter().map(|(_, ty)| *ty).collect();
             GenericContext::from_typevar_instances(self.db, synthetic_type_vars)
-                .specialize(self.db, synthetic_types);
+                .specialize(self.db, synthetic_types)
+        };
+
+        let mut assigned_variables = FxHashMap::default();
 
         // Collect the synthetic type variable to which each formal type variable is mapped.
-        let mut synthetic_builder = SpecializationBuilder::new(self.db, self.inferable);
-        synthetic_builder.infer(formal, synthetic_actual)?;
-        let synthetic_type_mappings = synthetic_builder.type_mappings();
+        let synthetic_type_mappings = {
+            let mut synthetic_builder =
+                SpecializationBuilder::new(self.db, self.inferable.merge(&synthetic_inferable));
+
+            synthetic_builder.infer_map(formal, synthetic_actual, |(typevar, ty)| {
+                assigned_variables.insert(typevar.identity(self.db), typevar);
+                Some(ty)
+            })?;
+
+            synthetic_builder.into_type_mappings()
+        };
 
         // We can't recurse any further, just perform a regular inference with the current polarity.
         if synthetic_type_mappings.is_empty() {
@@ -2091,11 +2114,17 @@ impl<'db> SpecializationBuilder<'db> {
             });
         }
 
-        for (formal_type_var_identity, synthetic_type) in synthetic_type_mappings {
-            let formal_type_var = synthetic_builder
-                .variables
-                .get(formal_type_var_identity)
+        for (identity, synthetic_type) in synthetic_type_mappings {
+            let mut type_var = assigned_variables
+                .get(&identity)
+                .copied()
                 .expect("every type mapping stores its corresponding type variable");
+
+            // If we marked a synthetic type variable as inferable, map it back to the formal type
+            // variable it replaced.
+            if let Some(Type::TypeVar(formal_type_var)) = synthetic_types.get(&type_var) {
+                type_var = *formal_type_var;
+            }
 
             let actual_type = synthetic_type.apply_type_mapping(
                 self.db,
@@ -2104,12 +2133,12 @@ impl<'db> SpecializationBuilder<'db> {
             );
 
             if let Some(synthetic_type_var) = synthetic_type.as_typevar() {
-                // Created a type mapping to a synthetic type variable. Capture the variance
+                // Created a type mapping to a synthetic type variable. Update the variance
                 // and recurse deeper.
                 let variance = synthetic_type_var.variance_with_polarity(self.db, polarity);
 
                 self.infer_map_with_variance_impl(
-                    Type::TypeVar(*formal_type_var),
+                    Type::TypeVar(type_var),
                     actual_type,
                     variance,
                     f,
@@ -2117,7 +2146,7 @@ impl<'db> SpecializationBuilder<'db> {
             } else {
                 // We can't recurse any further, just perform a regular inference with the current polarity.
                 self.infer_map_impl(
-                    Type::TypeVar(*formal_type_var),
+                    Type::TypeVar(type_var),
                     actual_type,
                     &mut |type_assignment| f(type_assignment, polarity),
                 )?;
